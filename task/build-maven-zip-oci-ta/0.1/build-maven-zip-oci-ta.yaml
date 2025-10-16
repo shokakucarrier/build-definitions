@@ -115,7 +115,7 @@ spec:
           done
 
           if [ ${#missing_files[@]} -ne 0 ]; then
-            echo "file(s) below are missing:"
+            echo "file(s) below are missing from Hermeto Lockfile:"
             printf ' - %s\n' "${missing_files[@]}"
             exit 1
           fi
@@ -144,28 +144,38 @@ spec:
       script: |
         #!/bin/bash
         set -euo pipefail
-        if [ "$(find "/var/workdir/${PKG_ROOT}" -mindepth 1 -print -quit 2>/dev/null)" ]; then
-          select-oci-auth "$IMAGE" >auth.json
-          [ -n "$IMAGE_EXPIRES_AFTER" ] && EXPIRE_LABEL=("--annotation" "quay.expires-after=$IMAGE_EXPIRES_AFTER")
-          echo "Pushing image ${IMAGE} to registry"
+        select-oci-auth "$IMAGE" >auth.json
+        [ -n "$IMAGE_EXPIRES_AFTER" ] && EXPIRE_LABEL=("--annotation" "quay.expires-after=$IMAGE_EXPIRES_AFTER")
+        echo "Pushing image ${IMAGE} to registry"
+        cd "${PKG_ROOT}"
+        if ls *.tgz >/dev/null 2>&1 && ! ls *.zip >/dev/null 2>&1; then
           if ! retry oras push "$IMAGE" \
             --registry-config auth.json \
             "${EXPIRE_LABEL[@]}" \
-            --artifact-type application/vnd.maven+zip "${PKG_ROOT}/*"; then
+            --artifact-type application/vnd.npm+zip "./*"; then
             echo "Failed to push image ${IMAGE} to registry"
             exit 1
           fi
-          if ! RESULTING_DIGEST=$(retry oras resolve --registry-config auth.json "${IMAGE}"); then
-            echo "Failed to get digest for ${IMAGE} from registry"
+        elif ls *.zip >/dev/null 2>&1 && ! ls *.tgz >/dev/null 2>&1; then
+          if ! retry oras push "$IMAGE" \
+            --registry-config auth.json \
+            "${EXPIRE_LABEL[@]}" \
+            --artifact-type application/vnd.maven+zip "./*"; then
+            echo "Failed to push image ${IMAGE} to registry"
             exit 1
           fi
-          echo -n "$IMAGE" | tee "$(results.IMAGE_URL.path)"
-          echo -n "$RESULTING_DIGEST" | tee "$(results.IMAGE_DIGEST.path)"
-          echo -n "${IMAGE}@${RESULTING_DIGEST}" | tee "$(results.IMAGE_REF.path)"
         else
-          echo "The artifact file is not found!"
+          echo "Invalid input containing both npm and maven artifacts"
           exit 1
         fi
+
+        if ! RESULTING_DIGEST=$(retry oras resolve --registry-config auth.json "${IMAGE}"); then
+          echo "Failed to get digest for ${IMAGE} from registry"
+          exit 1
+        fi
+        echo -n "$IMAGE" | tee "$(results.IMAGE_URL.path)"
+        echo -n "$RESULTING_DIGEST" | tee "$(results.IMAGE_DIGEST.path)"
+        echo -n "${IMAGE}@${RESULTING_DIGEST}" | tee "$(results.IMAGE_REF.path)"
       computeResources:
         limits:
           memory: 8Gi
