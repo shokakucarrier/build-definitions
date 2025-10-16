@@ -7,8 +7,8 @@ Note that this task needs the output of prefetch-dependencies task. If it is not
 ## Parameters
 |name|description|default value|required|
 |---|---|---|---|
+|input|The hermeto lockfile of archived artifacts|""|false|
 |CACHI2_ARTIFACT|The Trusted Artifact URI pointing to the artifact with the prefetched dependencies.|""|false|
-|FILE_NAME|The zip bundle file name of archived artifacts|maven-repository|false|
 |IMAGE|Reference of the OCI-Artifact this build task will produce.||true|
 |IMAGE_EXPIRES_AFTER|Delete image tag after specified time. Empty means to keep the image tag. Time values could be something like 1h, 2d, 3w for hours, days, and weeks, respectively.|""|false|
 |PREFETCH_ROOT|The root directory of the artifacts under the prefetched directory. Will be kept in the maven zip as the top directory for all artifacts.|maven-repository|false|
