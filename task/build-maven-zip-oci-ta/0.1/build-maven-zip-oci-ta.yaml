@@ -15,15 +15,15 @@ spec:
     In addition it will use the SBOM file in prefetch-task, pushes the SBOM file to same registry of zip oci-artifact using cosign tool.
     Note that this task needs the output of prefetch-dependencies task. If it is not activated, there will not be any output from this task.
   params:
+    - name: input
+      description: The Hermeto lockfile containing artifacts fetched.
+      type: string
+      default: ""
     - name: CACHI2_ARTIFACT
       description: The Trusted Artifact URI pointing to the artifact with
         the prefetched dependencies.
       type: string
       default: ""
-    - name: FILE_NAME
-      description: The zip bundle file name of archived artifacts
-      type: string
-      default: maven-repository
     - name: IMAGE
       description: Reference of the OCI-Artifact this build task will produce.
       type: string
@@ -74,8 +74,8 @@ spec:
       emptyDir: {}
   stepTemplate:
     env:
-      - name: FILE_NAME
-        value: $(params.FILE_NAME)
+      - name: INPUT
+        value: $(params.input)
       - name: IMAGE
         value: $(params.IMAGE)
       - name: IMAGE_EXPIRES_AFTER
@@ -93,39 +93,42 @@ spec:
       args:
         - use
         - $(params.CACHI2_ARTIFACT)=/var/workdir/cachi2
-    - name: prepare
-      image: quay.io/konflux-ci/appstudio-utils:1610c1fc4cfc9c9053dbefc1146904a4df6659ef@sha256:90ac97b811073cb99a23232c15a08082b586c702b85da6200cf54ef505e3c50c
+    - name: check-artifact
+      image: quay.io/konflux-ci/yq:latest@sha256:7ef2e2f76ca36bdc7eb9203df31f3bce546d1267b969d9bd2691094b88610dbb
       workingDir: /var/workdir
       script: |
         #!/bin/bash
         set -euo pipefail
-        # Generate checksums for all maven artifact files. It will ignore the checksum files
-        # and signature files if they existed there
-        pkgpath="/var/workdir/cachi2/output/deps/generic"
-        if [ -d "$pkgpath/${PKG_ROOT}" ]; then
-          echo "Generating checksums for artifacts"
-          while IFS= read -r -d '' f; do
-            md5sum "$f" | awk '{print $1}' >"$f.md5"
-            sha1sum "$f" | awk '{print $1}' >"$f.sha1"
-            sha256sum "$f" | awk '{print $1}' >"$f.sha256"
-          done < <(find "$pkgpath/${PKG_ROOT}" -type f ! -name "*.md5" \
-            ! -name "*.sha1" ! -name "*.sha128" ! -name "*.sha256" \
-            ! -name "*.sha512" ! -name "*.asc" -print0)
-          # Bundle the artifacts and checksums together into a zip file
-          cd "$pkgpath"
-          echo "create maven zip to /var/workdir/cachi2/output/${FILE_NAME}.zip"
-          zip -rq "${FILE_NAME}.zip" "${PKG_ROOT}"
-          mv "${FILE_NAME}.zip" "/shared/${FILE_NAME}.zip"
+        pkgpath="/var/workdir/cachi2/output/deps/generic/${PKG_ROOT}"
+        mkdir -p "/var/workdir/${PKG_ROOT}"
+        if [ "$(find "$pkgpath" -mindepth 1 -print -quit 2>/dev/null)" ]; then
+          cd pkgpath
+          files_to_check=$(yq -r '.artifacts[].filename' <<< "$INPUT")
+
+          missing_files=()
+          for file in $files_to_check; do
+            if [ ! -f "$file" ]; then
+              missing_files+=("$file")
+            else
+              mv -v "$file" "/var/workdir/${PKG_ROOT}"
+            fi
+          done
+
+          if [ ${#missing_files[@]} -ne 0 ]; then
+            echo "file(s) below are missing from Hermeto Lockfile:"
+            printf ' - %s\n' "${missing_files[@]}"
+            exit 1
+          fi
         else
-          echo "No ${PKG_ROOT} dir found, can not generate maven zip!"
+          echo "No file in ${PKG_ROOT} dir, no artifacts detected"
           exit 1
         fi
       computeResources:
         limits:
-          memory: 8Gi
+          memory: 512Mi
         requests:
-          cpu: "1"
-          memory: 2Gi
+          cpu: 100m
+          memory: 256Mi
       securityContext:
         capabilities:
           add:
@@ -140,29 +143,79 @@ spec:
       script: |
         #!/bin/bash
         set -euo pipefail
-        if [ -f "/shared/${FILE_NAME}.zip" ]; then
-          mv "/shared/${FILE_NAME}.zip" "./${FILE_NAME}.zip"
-          select-oci-auth "$IMAGE" >auth.json
-          [ -n "$IMAGE_EXPIRES_AFTER" ] && EXPIRE_LABEL=("--annotation" "quay.expires-after=$IMAGE_EXPIRES_AFTER")
-          echo "Pushing image ${IMAGE} to registry"
+        select-oci-auth "$IMAGE" >auth.json
+        [ -n "$IMAGE_EXPIRES_AFTER" ] && EXPIRE_LABEL=("--annotation" "quay.expires-after=$IMAGE_EXPIRES_AFTER")
+        echo "Pushing image ${IMAGE} to registry"
+        cd "${PKG_ROOT}"
+
+        files_to_push=$(yq -r '.artifacts[] | select(.filename | test(".(zip|tgz|tar.gz)$")) | .filename' <<< "$INPUT")
+        case $(echo "$files_to_push" | head -n 1) in
+          *.zip)
+            PACKAGE_TYPE="maven+zip"
+            ;;
+          *.tgz|*.tar.gz)
+            PACKAGE_TYPE="npm+tgz"
+            ;;
+        esac
+
+        for file in $files_to_push; do
+          temp_dir=$(mktemp -d)
+          case "$file" in
+            *.zip)
+              if [ "$PACKAGE_TYPE" = "maven+zip" ]; then
+                  unzip -q "$file" -d "$temp_dir"
+                  if find "$temp_dir" -name "pom.xml" -print -quit | grep -q "."; then
+                    :
+                  else
+                    PACKAGE_TYPE="Unknown"
+                    rm -rf "$temp_dir"
+                    break
+                  fi
+              else
+                PACKAGE_TYPE="Unknown"
+                rm -rf "$temp_dir"
+                break
+              fi
+              ;;
+            *.tgz|*.tar.gz)
+              if [ "$PACKAGE_TYPE" = "npm+tgz" ]; then
+                tar -xzf "$file" -d "$temp_dir"
+                if find "$temp_dir" -name "package.json" -print -quit | grep -q "."; then
+                  :
+                else
+                  PACKAGE_TYPE="Unknown"
+                  rm -rf "$temp_dir"
+                  break
+                fi
+              else
+                PACKAGE_TYPE="Unknown"
+                rm -rf "$temp_dir"
+                break
+              fi
+              ;;
+          esac
+          rm -rf "$temp_dir"
+        done
+
+        if [ "$PACKAGE_TYPE" != "Unknown" ]; then
           if ! retry oras push "$IMAGE" \
             --registry-config auth.json \
             "${EXPIRE_LABEL[@]}" \
-            --artifact-type application/vnd.maven+zip "${FILE_NAME}.zip"; then
+            --artifact-type application/vnd."$PACKAGE_TYPE" "$files_to_push"; then
             echo "Failed to push image ${IMAGE} to registry"
-            exit 1
           fi
-          if ! RESULTING_DIGEST=$(retry oras resolve --registry-config auth.json "${IMAGE}"); then
-            echo "Failed to get digest for ${IMAGE} from registry"
-            exit 1
-          fi
-          echo -n "$IMAGE" | tee "$(results.IMAGE_URL.path)"
-          echo -n "$RESULTING_DIGEST" | tee "$(results.IMAGE_DIGEST.path)"
-          echo -n "${IMAGE}@${RESULTING_DIGEST}" | tee "$(results.IMAGE_REF.path)"
         else
-          echo "The maven zip file is not found!"
+          echo "Input containing invalid artifacts"
           exit 1
         fi
+
+        if ! RESULTING_DIGEST=$(retry oras resolve --registry-config auth.json "${IMAGE}"); then
+          echo "Failed to get digest for ${IMAGE} from registry"
+          exit 1
+        fi
+        echo -n "$IMAGE" | tee "$(results.IMAGE_URL.path)"
+        echo -n "$RESULTING_DIGEST" | tee "$(results.IMAGE_DIGEST.path)"
+        echo -n "${IMAGE}@${RESULTING_DIGEST}" | tee "$(results.IMAGE_REF.path)"
       computeResources:
         limits:
           memory: 8Gi
